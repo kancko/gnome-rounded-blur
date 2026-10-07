@@ -96,6 +96,9 @@ struct _GbBlurEffect
   int radius;
 
   float corner_radius;
+
+  /* Not owned: borrowed from the backend of the actor's ClutterContext. */
+  CoglContext *cogl_context;
 };
 
 G_DEFINE_TYPE (GbBlurEffect, gb_blur_effect, CLUTTER_TYPE_EFFECT)
@@ -111,20 +114,48 @@ enum {
 
 static GParamSpec *properties [N_PROPS] = { NULL, };
 
+/* clutter_get_default_backend() was dropped in mutter/clutter 51, so fetch the
+ * backend through the ClutterContext owned by the actor instead. The
+ * paint-context framebuffer is used as a fallback. */
+static CoglContext *
+get_cogl_context (GbBlurEffect        *self,
+                  ClutterPaintContext *paint_context)
+{
+  ClutterContext *clutter_context;
+  ClutterBackend *backend;
+  CoglContext *ctx = NULL;
+
+  if (self->actor)
+    {
+      clutter_context = clutter_actor_get_context (self->actor);
+      if (clutter_context)
+        {
+          backend = clutter_context_get_backend (clutter_context);
+          if (backend)
+            ctx = clutter_backend_get_cogl_context (backend);
+        }
+    }
+
+  if (!ctx && paint_context)
+    {
+      CoglFramebuffer *framebuffer =
+        clutter_paint_context_get_framebuffer (paint_context);
+
+      if (framebuffer)
+        ctx = cogl_framebuffer_get_context (framebuffer);
+    }
+
+  return ctx;
+}
+
 static CoglPipeline*
-create_base_pipeline (void)
+create_base_pipeline (CoglContext *ctx)
 {
   static CoglPipeline *base_pipeline = NULL;
 
   if (G_UNLIKELY (base_pipeline == NULL))
     {
-       ClutterBackend *backend = clutter_get_default_backend ();
-      
-      CoglContext *ctx =
-        clutter_backend_get_cogl_context (backend);
-      
-        
-      
+      g_return_val_if_fail (ctx != NULL, NULL);
 
       base_pipeline = cogl_pipeline_new (ctx);
       cogl_pipeline_set_layer_null_texture (base_pipeline, 0);
@@ -141,7 +172,7 @@ create_base_pipeline (void)
 }
 
 static CoglPipeline*
-create_brightness_pipeline (void)
+create_brightness_pipeline (CoglContext *ctx)
 {
   static CoglPipeline *brightness_pipeline = NULL;
 
@@ -149,7 +180,7 @@ create_brightness_pipeline (void)
     {
       CoglSnippet *snippet;
 
-      brightness_pipeline = create_base_pipeline ();
+      brightness_pipeline = create_base_pipeline (ctx);
 
       snippet = cogl_snippet_new (COGL_SNIPPET_HOOK_FRAGMENT,
                                   brightness_glsl_declarations,
@@ -162,14 +193,14 @@ create_brightness_pipeline (void)
 }
 
 static CoglPipeline*
-create_mask_pipeline (void)
+create_mask_pipeline (CoglContext *ctx)
 {
   static CoglPipeline *mask_pipeline = NULL;
 
   if (G_UNLIKELY (mask_pipeline == NULL))
   {
     CoglSnippet *snippet;
-    mask_pipeline = create_base_pipeline ();
+    mask_pipeline = create_base_pipeline (ctx);
     snippet = cogl_snippet_new (COGL_SNIPPET_HOOK_FRAGMENT,
                                 mask_glsl_declarations,
                                 mask_glsl);
@@ -185,6 +216,9 @@ update_brightness (GbBlurEffect *self,
                    uint8_t        paint_opacity)
 {
   CoglColor color;
+
+  if (!self->brightness_fb.pipeline)
+    return;
 
   cogl_color_init_from_4f (&color,
                            paint_opacity / 255.0, paint_opacity / 255.0,
@@ -238,18 +272,16 @@ setup_projection_matrix (CoglFramebuffer *framebuffer,
 }
 
 static gboolean
-update_fbo (FramebufferData *data,
+update_fbo (CoglContext     *ctx,
+            FramebufferData *data,
             unsigned int     width,
             unsigned int     height,
             float            downscale_factor)
 {
-   ClutterBackend *backend = clutter_get_default_backend ();
-  
-  CoglContext *ctx =
-    clutter_backend_get_cogl_context (backend);
-  
-    
-  
+  if (!ctx)
+    return FALSE;
+
+
 
   g_clear_object (&data->texture);
   g_clear_object (&data->framebuffer);
@@ -292,7 +324,8 @@ update_actor_fbo (GbBlurEffect *self,
 
   self->cache_flags &= ~ACTOR_PAINTED;
 
-  return update_fbo (&self->actor_fb, width, height, downscale_factor);
+  return update_fbo (self->cogl_context,
+                     &self->actor_fb, width, height, downscale_factor);
 }
 
 static gboolean
@@ -309,7 +342,8 @@ update_brightness_fbo (GbBlurEffect *self,
       return TRUE;
     }
 
-  return update_fbo (&self->brightness_fb,
+  return update_fbo (self->cogl_context,
+                     &self->brightness_fb,
                      width, height,
                      downscale_factor);
 }
@@ -326,7 +360,8 @@ update_background_fbo (GbBlurEffect *self,
       return TRUE;
     }
 
-  return update_fbo (&self->background_fb, width, height, 1.0);
+  return update_fbo (self->cogl_context,
+                     &self->background_fb, width, height, 1.0);
 }
 
 static gboolean
@@ -343,7 +378,8 @@ update_mask_fbo (GbBlurEffect *self,
     return TRUE;
   }
 
-  return update_fbo (&self->mask_fb, width, height, downscale_factor);
+  return update_fbo (self->cogl_context,
+                     &self->mask_fb, width, height, downscale_factor);
 }
 
 static void
@@ -578,6 +614,48 @@ paint_background (GbBlurEffect      *self,
                                         transformed_height);
 }
 
+/* Pipelines used to be built in init(), but the CoglContext is only reachable
+ * once the effect is attached to an actor, so build them on first paint. */
+static gboolean
+ensure_pipelines (GbBlurEffect        *self,
+                  ClutterPaintContext *paint_context)
+{
+  if (G_LIKELY (self->actor_fb.pipeline &&
+                self->background_fb.pipeline &&
+                self->brightness_fb.pipeline &&
+                self->mask_fb.pipeline))
+    return TRUE;
+
+  if (!self->cogl_context)
+    self->cogl_context = get_cogl_context (self, paint_context);
+
+  if (!self->cogl_context)
+    return FALSE;
+
+  g_clear_object (&self->actor_fb.pipeline);
+  g_clear_object (&self->background_fb.pipeline);
+  g_clear_object (&self->brightness_fb.pipeline);
+  g_clear_object (&self->mask_fb.pipeline);
+
+  self->actor_fb.pipeline = create_base_pipeline (self->cogl_context);
+  self->background_fb.pipeline = create_base_pipeline (self->cogl_context);
+  self->brightness_fb.pipeline = create_brightness_pipeline (self->cogl_context);
+  self->mask_fb.pipeline = create_mask_pipeline (self->cogl_context);
+
+  if (!self->actor_fb.pipeline || !self->background_fb.pipeline ||
+      !self->brightness_fb.pipeline || !self->mask_fb.pipeline)
+    return FALSE;
+
+  self->brightness_uniform =
+    cogl_pipeline_get_uniform_location (self->brightness_fb.pipeline, "brightness");
+  self->corner_radius_uniform =
+    cogl_pipeline_get_uniform_location (self->mask_fb.pipeline, "u_corner_radius");
+  self->mask_size_uniform =
+    cogl_pipeline_get_uniform_location (self->mask_fb.pipeline, "u_size");
+
+  return TRUE;
+}
+
 static gboolean
 update_framebuffers (GbBlurEffect       *self,
                      ClutterPaintContext *paint_context,
@@ -710,6 +788,9 @@ gb_blur_effect_paint_node (ClutterEffect           *effect,
   uint8_t paint_opacity;
 
   g_assert (self->actor != NULL);
+
+  if (!ensure_pipelines (self, paint_context))
+    goto fail;
 
   if (self->radius > 0)
     {
@@ -911,16 +992,11 @@ gb_blur_effect_init (GbBlurEffect *self)
   self->brightness = 1.f;
   self->corner_radius = 0.f;
 
-  self->actor_fb.pipeline = create_base_pipeline ();
-  self->background_fb.pipeline = create_base_pipeline ();
-  self->brightness_fb.pipeline = create_brightness_pipeline ();
-  self->mask_fb.pipeline = create_mask_pipeline ();
-  self->brightness_uniform =
-    cogl_pipeline_get_uniform_location (self->brightness_fb.pipeline, "brightness");
-  self->corner_radius_uniform =
-    cogl_pipeline_get_uniform_location (self->mask_fb.pipeline, "u_corner_radius");
-  self->mask_size_uniform =
-    cogl_pipeline_get_uniform_location (self->mask_fb.pipeline, "u_size");
+  /* The pipelines are created lazily in ensure_pipelines(), once the effect
+   * has an actor and the CoglContext can be reached. */
+  self->brightness_uniform = -1;
+  self->corner_radius_uniform = -1;
+  self->mask_size_uniform = -1;
 }
 
 GbBlurEffect *

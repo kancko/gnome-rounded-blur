@@ -21,7 +21,24 @@ libdir = join_paths(prefix, get_option('libdir'))
 includedir = join_paths(prefix, get_option('includedir'))
 datadir = join_paths(prefix, get_option('datadir'))
 
-mutter_api_version = '18'
+# mutter renamed its pkg-config files: the ABI number up to GNOME 50
+# (libmutter-18), then the release number from GNOME 51 on (libmutter-51).
+# Detect whichever is installed instead of hardcoding it.
+pkg_config_bin = find_program('pkg-config', 'pkgconf')
+libmutter_pc = ''
+foreach line : run_command(pkg_config_bin, '--list-all', check: true).stdout().split('\n')
+  tokens = line.strip().split(' ')
+  if tokens.length() > 0 and tokens[0].startswith('libmutter-')
+    libmutter_pc = tokens[0]
+  endif
+endforeach
+if libmutter_pc == ''
+  error('No libmutter-*.pc found, is mutter installed with its development files?')
+endif
+
+mutter_api_version = libmutter_pc.split('libmutter-')[1]
+message('Detected mutter API version: ' + mutter_api_version)
+
 mutter_req = '>= 50.0'
 
 clutter_pc = 'mutter-clutter-' + mutter_api_version
@@ -37,7 +54,7 @@ clutter_dep = dependency(clutter_pc, version: mutter_req,
 cogl_dep = dependency(cogl_pc, version: mutter_req,
   required: false,
 )
-libmutter_dep = dependency('libmutter-18')
+libmutter_dep = dependency(libmutter_pc)
 
 # Required dependencies
 deps = [
