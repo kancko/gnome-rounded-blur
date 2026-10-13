@@ -56,6 +56,11 @@ static const gchar *mask_glsl =
 #define MIN_DOWNSCALE_SIZE 256.f
 #define MAX_RADIUS 12.f
 
+/* Same value as Clutter's CLUTTER_COORDINATE_EPSILON (1.0 / 256.0), which is
+ * private to mutter and thus not available in the public headers.
+ */
+#define GB_COORDINATE_EPSILON (1.0 / 256.0)
+
 typedef enum
 {
   ACTOR_PAINTED = 1 << 0,
@@ -437,6 +442,62 @@ gb_blur_effect_set_actor (ClutterActorMeta *meta,
   self->actor = clutter_actor_meta_get_actor (meta);
 }
 
+/* Derive the actor-to-framebuffer scale for off-stage paints (e.g. stage
+ * screenshots), where no stage view is associated with the paint context.
+ *
+ * The actor's transformed position and size are in stage coordinates, while
+ * the off-stage paint target is sized in physical pixels. The ratio between
+ * the target framebuffer and the stage's allocation gives the factor that
+ * maps stage coordinates onto the target. Both quantities are read directly
+ * (no matrix or projection math), which keeps this robust for any paint
+ * target: a screenshot framebuffer, a clone, or a nested offscreen.
+ *
+ * Returns FALSE and leaves *scale untouched when the ratio cannot be
+ * determined, so the caller can fall back to 1.0.
+ */
+static gboolean
+derive_offscreen_scale (GbBlurEffect       *self,
+                        ClutterPaintContext *paint_context,
+                        float               *scale)
+{
+  ClutterActor *stage;
+  ClutterActorBox stage_box;
+  CoglFramebuffer *framebuffer;
+  int fb_width, fb_height;
+  float stage_width, stage_height;
+
+  framebuffer = clutter_paint_context_get_framebuffer (paint_context);
+  if (!framebuffer)
+    return FALSE;
+
+  fb_width = cogl_framebuffer_get_width (framebuffer);
+  fb_height = cogl_framebuffer_get_height (framebuffer);
+  if (fb_width <= 0 || fb_height <= 0)
+    return FALSE;
+
+  stage = clutter_actor_get_stage (self->actor);
+  if (!stage)
+    return FALSE;
+
+  clutter_actor_get_allocation_box (stage, &stage_box);
+  stage_width = stage_box.x2 - stage_box.x1;
+  stage_height = stage_box.y2 - stage_box.y1;
+  if (stage_width <= 0.0f || stage_height <= 0.0f)
+    return FALSE;
+
+  *scale = (float) fb_width / stage_width;
+
+  /* Sanity check: the derived factor must be consistent in both axes. A
+   * mismatch means the target does not uniformly scale the stage (rotated
+   * or otherwise transformed paint target); don't guess in that case.
+   */
+  if (!G_APPROX_VALUE (*scale, (float) fb_height / stage_height,
+                       GB_COORDINATE_EPSILON))
+    return FALSE;
+
+  return TRUE;
+}
+
 static void
 update_actor_box (GbBlurEffect       *self,
                   ClutterPaintContext *paint_context,
@@ -469,11 +530,17 @@ update_actor_box (GbBlurEffect       *self,
           origin_x -= stage_view_layout.x;
           origin_y -= stage_view_layout.y;
         }
+      else if (derive_offscreen_scale (self, paint_context,
+                                       &box_scale_factor))
+        {
+          /* Off-stage paint (e.g. screenshot): the scale was derived from the
+           * paint target's size relative to the stage allocation. No stage
+           * view layout offset applies.
+           */
+        }
       else
         {
-          /* If we're drawing off stage, just assume scale = 1, this won't work
-           * with stage-view scaling though.
-           */
+          /* Could not derive the scale; fall back to 1. */
         }
 
       clutter_actor_box_set_origin (source_actor_box, origin_x, origin_y);
